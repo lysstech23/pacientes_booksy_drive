@@ -2,539 +2,184 @@
 # -*- coding: utf-8 -*-
 
 """
-Script to extract patient details from Booksy booking emails and write them into a Google Sheet.
+Booksy → Gmail → Google Sheets/Drive + export a repo outputs/.
 
-This script connects to Gmail and searches for messages from the sender `no-reply@booksy.com`. For each email,
-it extracts the patient's first name, last name, telephone and email address. The information is appended to a
-Google Sheet named ``directorio_pacientes``. To avoid reprocessing the same emails, the Gmail message ID and
-processing timestamp are stored in a meta sheet. Duplicate entries (same phone or email) are not added.
+Funciones clave:
+- Lee Gmail (from:no-reply@booksy.com), parsea Nombre/Apellidos/Teléfono/Email con heurísticas robustas.
+- Evita duplicados por Gmail Message-ID, email y teléfono.
+- Escribe/actualiza Google Sheet 'directorio_pacientes' (en carpeta Drive 'Automatizaciones-no-tocar').
+- Ordena por Nombre.
+- Normaliza capitalización de nombres y apellidos (Title case estricto).
+- Exporta a GitHub workspace: outputs/pacs_contacts.csv y outputs/pacs_contacts_index.json.
+- Reutiliza hoja existente si se pasa GOOGLE_SHEETS_SPREADSHEET_ID; si no, busca por título y/o crea.
 
-Features:
+Requiere:
+- Variables de entorno (en GitHub Actions → Secrets) para OAuth:
+  GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN
+- Opcional: GOOGLE_SHEETS_SPREADSHEET_ID para reusar la misma hoja siempre.
 
-  * **Initial run** processes the complete history of the specified sender.
-  * **Recurring runs** only process unseen messages.
-  * **Deduplication** based on Gmail message ID and patient email/telephone.
-  * **Flexible parsing** to handle different Booksy email formats.
-  * **Configurable** via environment variables (client credentials, spreadsheet ID).
-
-Usage:
-    python src/booksy_gmail_to_sheets.py
-
-Environment Variables:
-
-    GOOGLE_CLIENT_ID:         OAuth client ID (for CI mode)
-    GOOGLE_CLIENT_SECRET:     OAuth client secret (for CI mode)
-    GOOGLE_REFRESH_TOKEN:     OAuth refresh token (for CI mode)
-    GOOGLE_ACCESS_TOKEN:      Optional, existing access token (will be refreshed if expired)
-    GOOGLE_SHEETS_SPREADSHEET_ID: ID of an existing spreadsheet (optional, will create if missing)
-    GOOGLE_SHEETS_TITLE:      Title of the spreadsheet to create if ID is not provided (default: "directorio_pacientes")
-
-Local Mode:
-    Provide a ``credentials.json`` OAuth client file in the working directory.
-    The first run will prompt a browser window to authorize. A ``token.json`` will be created for subsequent runs.
-
-Dependencies:
-    google-api-python-client
-    google-auth
-    google-auth-oauthlib
-    beautifulsoup4
-
+Ámbitos OAuth:
+- https://www.googleapis.com/auth/gmail.readonly
+- https://www.googleapis.com/auth/spreadsheets
+- https://www.googleapis.com/auth/drive.file
 """
 
-import base64
 import os
 import re
-import sys
-import time
-import json
-import datetime as dt
-from typing import Dict, List, Optional, Tuple
 import csv
+import json
+import time
+import base64
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timezone
 
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+# Google APIs
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
 
-from bs4 import BeautifulSoup
-
-
-GMAIL_QUERY = 'from:no-reply@booksy.com'
-SHEET_TITLE = os.getenv("GOOGLE_SHEETS_TITLE", "directorio_pacientes")
-META_SHEET = "_meta_processed_messages"
+# === Config ===
+BOOKSY_SENDER = "no-reply@booksy.com"
+SHEET_TITLE = "directorio_pacientes"
 DATA_SHEET = "directorio_pacientes"
+META_SHEET = "_meta_processed_messages"
+
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.file",
 ]
 
-
-def _creds_from_env() -> Optional[Credentials]:
-    """Create OAuth credentials from environment variables."""
-    cid = os.getenv("GOOGLE_CLIENT_ID")
-    cs = os.getenv("GOOGLE_CLIENT_SECRET")
-    rt = os.getenv("GOOGLE_REFRESH_TOKEN")
-    token = os.getenv("GOOGLE_ACCESS_TOKEN")
-    if cid and cs and rt:
-        data = {
-            "token": token or "",
-            "refresh_token": rt,
-            "client_id": cid,
-            "client_secret": cs,
-            "scopes": SCOPES,
-            "token_uri": "https://oauth2.googleapis.com/token",
-        }
-        creds = Credentials.from_authorized_user_info(data)
-        if not creds.valid and creds.refresh_token:
-            creds.refresh(Request())
-        return creds
-    return None
-
-
-def _creds_local() -> Credentials:
-    """Create OAuth credentials for local runs using credentials.json/token.json."""
-    token_path = "token.json"
-    creds = None
-    if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not os.path.exists("credentials.json"):
-                print("ERROR: Missing credentials.json for local mode.", file=sys.stderr)
-                sys.exit(1)
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(token_path, "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
-    return creds
-
-
-def get_creds() -> Credentials:
-    """Load credentials either from environment or via local OAuth flow."""
-    creds = _creds_from_env()
-    if creds:
-        return creds
-    return _creds_local()
-
-
-def gmail_service(creds: Credentials):
-    """Initialize Gmail API service."""
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
-
-
-def list_message_ids(service, user_id: str, query: str) -> List[str]:
-    """List all message IDs matching the given Gmail query."""
-    ids: List[str] = []
-    page_token: Optional[str] = None
-    while True:
-        resp = (
-            service.users()
-            .messages()
-            .list(userId=user_id, q=query, pageToken=page_token, maxResults=500)
-            .execute()
+# === Utilidades de OAuth por variables de entorno (sin usar archivos locales) ===
+def _creds_from_env() -> Credentials:
+    client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+    refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+    if not client_id or not client_secret or not refresh_token:
+        raise RuntimeError(
+            "Faltan GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN."
         )
-        for m in resp.get("messages", []):
-            ids.append(m["id"])
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    return ids
-
-
-def get_message_full(service, user_id: str, msg_id: str) -> Dict:
-    """Get the full message including payload and internalDate."""
-    return (
-        service.users().messages().get(userId=user_id, id=msg_id, format="full").execute()
+    return Credentials(
+        None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=SCOPES,
     )
 
+def get_creds() -> Credentials:
+    creds = _creds_from_env()
+    # refresco proactivo
+    try:
+        if not creds.valid:
+            creds.refresh(Request())
+    except Exception:
+        # segundo intento tras breve espera
+        time.sleep(1.0)
+        creds.refresh(Request())
+    return creds
 
-def decode_body(payload: Dict) -> str:
-    """
-    Decode the email payload into plain text.
-
-    Prefers HTML parts converted to text via BeautifulSoup, falls back to text/plain parts.
-    """
-    parts: List[str] = []
-
-    def _walk(part: Dict):
-        mime = part.get("mimeType", "")
-        body = part.get("body", {})
-        data = body.get("data")
-        if part.get("parts"):
-            for sp in part["parts"]:
-                _walk(sp)
-        else:
-            if data:
-                try:
-                    raw = base64.urlsafe_b64decode(data.encode("utf-8"))
-                except Exception:
-                    raw = base64.b64decode(data)
-                if mime == "text/html":
-                    soup = BeautifulSoup(raw, "html.parser")
-                    text = soup.get_text("\n")
-                    parts.append(text)
-                elif mime == "text/plain":
-                    parts.append(raw.decode("utf-8", errors="ignore"))
-
-    _walk(payload)
-    if not parts:
-        body = payload.get("body", {}).get("data")
-        if body:
-            raw = base64.urlsafe_b64decode(body.encode("utf-8"))
-            try:
-                soup = BeautifulSoup(raw, "html.parser")
-                parts.append(soup.get_text("\n"))
-            except Exception:
-                parts.append(raw.decode("utf-8", errors="ignore"))
-    text = "\n".join([p.strip() for p in parts if p and p.strip()])
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    return text
-
-
-EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}")
-PHONE_RE = re.compile(r"(?:\+?34[\s\-]?)?(?:\d[\s\-]?){9,13}")
-
-
-def normalize_phone(s: str) -> str:
-    """Normalize phone number: remove non-digits and ensure Spanish prefix if missing."""
-    s2 = re.sub(r"[^\d+]", "", s)
-    if s2.startswith("+"):
-        return s2
-    digits = re.sub(r"\D", "", s2)
-    if len(digits) == 9:
-        return "+34" + digits
-    return s2
-
-
-def guess_name_lines(text: str, email_found: Optional[str], phone_found: Optional[str]) -> str:
-    """Heuristic to guess the patient's full name from the email body."""
-    # Look for pattern '¡Nombre Apellido: nueva reserva'
-    m = re.search(r"¡\s*([^\n:]+?)\s*:\s*nueva\s+reserva", text, flags=re.I)
-    if m:
-        return m.group(1).strip()
-    # Also handle phrase 'cita para <nombre> Consulta' (e.g. cancellation emails)
-    m2 = re.search(r"cita\s+para\s+([^\n]+?)\s+Consulta", text, flags=re.I)
-    if m2:
-        return m2.group(1).strip()
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    indices = []
-    if email_found:
-        for i, ln in enumerate(lines):
-            if email_found in ln:
-                indices.append(i)
-    if phone_found:
-        for i, ln in enumerate(lines):
-            if re.sub(r"\s+", "", phone_found) in re.sub(r"\s+", "", ln):
-                indices.append(i)
-    candidates = []
-    for idx in indices or [0]:
-        for j in range(max(0, idx - 3), min(len(lines), idx + 3)):
-            ln = lines[j]
-            # Skip lines containing emails or phones
-            if EMAIL_RE.search(ln) or PHONE_RE.search(ln):
-                continue
-            # Skip lines that look like money, EUR or contain time (e.g. 16:30)
-            if re.search(r"\b€|\bEUR|\d{1,2}:\d{2}", ln):
-                continue
-            # Skip URL-like lines
-            lnl = ln.lower()
-            if "http" in lnl or "https" in lnl:
-                continue
-            # Handle Booksy branding lines and bullet characters.
-            # Booksy sometimes prefixes names with a bullet (e.g. "• Maria Garcia").
-            # If a line starts with a bullet, strip it off before further checks instead of discarding it.
-            if ln.startswith("•"):
-                ln = ln.lstrip("•").strip()
-                lnl = ln.lower()
-            # Skip lines starting with Booksy (branding), which should not be used for names.
-            if lnl.startswith("booksy"):
-                continue
-            tokens = ln.split()
-            if 1 <= len(tokens) <= 5:
-                # Count how many tokens start with an uppercase letter (for languages using accents)
-                cap_score = sum(
-                    1 for t in tokens if re.match(r"^[A-ZÁÉÍÓÚÑ][a-záéíóúñü]+$", t)
-                )
-                # Store tuple of index, line and capitalization score
-                candidates.append((j, ln, cap_score))
-    if candidates:
-        # Prefer lines with more capitalized tokens; tie‑break by closeness to the email/phone line
-        candidates.sort(key=lambda x: (-x[2], x[0]))
-        return candidates[0][1]
-    # Fallback: return the first plausible line among the first 20 lines.
-    # If a line begins with a bullet, strip the bullet before evaluating and returning.
-    for ln in lines[:20]:
-        # Remove a leading bullet character if present
-        ln_clean = ln.lstrip("•").strip() if ln.startswith("•") else ln
-        tokens = ln_clean.split()
-        if (
-            1 <= len(tokens) <= 5
-            and not EMAIL_RE.search(ln)
-            and not PHONE_RE.search(ln)
-            and "http" not in ln.lower()
-            and "https" not in ln.lower()
-        ):
-            return ln_clean
-    return ""
-
-
-def split_name(full_name: str) -> Tuple[str, str]:
-    """Split full name into first name and surnames."""
-    full_name = re.sub(r"\s+", " ", full_name).strip()
-    if not full_name:
-        return "", ""
-    parts = full_name.split(" ")
-    if len(parts) == 1:
-        return parts[0], ""
-    return parts[0], " ".join(parts[1:])
-
-
-def normalize_case(name: str) -> str:
-    """Return a name string with each word capitalised and the rest in lowercase.
-
-    Examples:
-        >>> normalize_case("maria eugenia moreno")
-        'Maria Eugenia Moreno'
-
-    This helper ensures consistency when storing names in the sheet and
-    generating patient lists for other scripts. It does not alter
-    embedded punctuation beyond standardising whitespace.
-    """
-    if not name:
-        return ""
-    words: List[str] = []
-    for w in name.strip().split():
-        if not w:
-            continue
-        # Capitalise first character and lowercase the rest. This works
-        # for accented letters in most cases.
-        words.append(w[0].upper() + w[1:].lower() if len(w) > 1 else w.upper())
-    return " ".join(words)
-
-
-def parse_patient(text: str) -> Dict[str, str]:
-    """Extract patient data from the body text."""
-    email_match = EMAIL_RE.search(text)
-    phone_match = PHONE_RE.search(text)
-    email = email_match.group(0).strip() if email_match else ""
-    phone_raw = phone_match.group(0).strip() if phone_match else ""
-    phone = normalize_phone(phone_raw) if phone_raw else ""
-    name_line = guess_name_lines(text, email, phone)
-    nombre, apellidos = split_name(name_line)
-    # Normalise the capitalisation of names: first letter uppercase, rest lowercase
-    nombre = normalize_case(nombre)
-    apellidos = normalize_case(apellidos)
-    return {
-        "nombre": nombre,
-        "apellidos": apellidos,
-        "telefono": phone,
-        "email": email,
-    }
-
+# === Servicios Google ===
+def gmail_service(creds: Credentials):
+    return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 def sheets_service(creds: Credentials):
-    """Initialize Google Sheets API service."""
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-
-def get_or_create_spreadsheet_id(svc, title: str, drive=None) -> str:
-    """
-    Return the spreadsheet ID for a given title, creating it if necessary.
-
-    This helper first checks if a specific spreadsheet ID has been provided via the
-    ``GOOGLE_SHEETS_SPREADSHEET_ID`` environment variable. If so, it is returned
-    immediately. Otherwise, when a Drive service is available, the function
-    attempts to locate an existing Google Sheets file with the requested title
-    inside the ``Automatizaciones-no tocar`` folder. If found, its ID is returned.
-    Only when no such file exists is a new spreadsheet created. Newly created
-    spreadsheets are moved into the designated folder to keep files organised.
-
-    :param svc: An authorized Sheets API service instance.
-    :param title: The title of the spreadsheet to locate or create.
-    :param drive: Optional Drive API service used for searching and moving files.
-    :return: The spreadsheet ID as a string.
-    """
-    # Respect explicit spreadsheet ID if provided via environment variables.
-    ssid_env = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
-    if ssid_env:
-        return ssid_env
-
-    # When Drive service is available, look for an existing spreadsheet with the same title
-    # inside the target folder. If found, reuse its ID instead of creating a new file.
-    folder_id: Optional[str] = None
-    if drive is not None:
-        # Ensure the target folder exists (creating it if necessary)
-        folder_id = get_or_create_folder_id(drive, "Automatizaciones-no tocar")
-        # Escape single quotes in the title for the Drive query.
-        name_q = title.replace("'", "\\'")
-        query = (
-            f"name = '{name_q}' and "
-            "mimeType = 'application/vnd.google-apps.spreadsheet' and "
-            f"'{folder_id}' in parents and trashed = false"
-        )
-        try:
-            resp = (
-                drive.files()
-                .list(
-                    q=query,
-                    spaces="drive",
-                    fields="files(id,name)",
-                    pageSize=1,
-                )
-                .execute()
-            )
-            files = resp.get("files", []) if resp else []
-            if files:
-                return files[0]["id"]
-        except Exception:
-            # If the search fails for any reason, continue to creation fallback.
-            pass
-
-    # If not found or Drive is unavailable, create a new spreadsheet
-    body = {"properties": {"title": title}}
-    resp = svc.spreadsheets().create(body=body, fields="spreadsheetId").execute()
-    ssid = resp["spreadsheetId"]
-
-    # When a Drive service exists, move the new spreadsheet into the target folder
-    if drive is not None:
-        try:
-            # Use previously resolved folder_id if available, otherwise create/find it now
-            if folder_id is None:
-                folder_id = get_or_create_folder_id(drive, "Automatizaciones-no tocar")
-            move_file_to_folder(drive, ssid, folder_id)
-        except Exception:
-            # Ignore any errors moving the file; the sheet will remain in root
-            pass
-
-    return ssid
-
 def drive_service(creds: Credentials):
-    """Initialize Google Drive API service."""
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-def get_or_create_folder_id(drive, folder_name: str = "Automatizaciones-no tocar") -> str:
-    """
-    Find or create a folder in Google Drive.
-
-    If a folder with the given name exists (and is not trashed), return its ID.
-    Otherwise create the folder and return the new folder ID.
-    """
-    # Escape single quotes in the folder name for the query
-    name_q = folder_name.replace("'", "\\'")
-    query = f"name = '{name_q}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    resp = drive.files().list(q=query, spaces="drive", fields="files(id,name)", pageSize=1).execute()
-    files = resp.get("files", [])
-    if files:
-        return files[0]["id"]
-    body = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
-    folder = drive.files().create(body=body, fields="id").execute()
+# === Drive helpers ===
+def get_or_create_folder_id(drive, folder_name: str = "Automatizaciones-no-tocar") -> str:
+    q = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    resp = drive.files().list(q=q, spaces="drive", fields="files(id,name)", pageSize=10).execute()
+    items = resp.get("files", [])
+    if items:
+        return items[0]["id"]
+    meta = {
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+    }
+    folder = drive.files().create(body=meta, fields="id").execute()
     return folder["id"]
 
 def move_file_to_folder(drive, file_id: str, folder_id: str):
-    """
-    Move a file into a target folder in Google Drive.
+    # quitar de padres actuales y mover al deseado
+    file_info = drive.files().get(fileId=file_id, fields="parents").execute()
+    prev_parents = ",".join(file_info.get("parents", []))
+    drive.files().update(fileId=file_id, addParents=folder_id, removeParents=prev_parents, fields="id, parents").execute()
 
-    Removes the file from its previous parent folders and adds the new folder as its parent.
+# === Sheets helpers ===
+def get_or_create_spreadsheet_id(svc, title: str, drive=None) -> str:
     """
-    # Get current parents
-    file = drive.files().get(fileId=file_id, fields="parents").execute()
-    prev_parents = ",".join(file.get("parents", []))
-    drive.files().update(
-        fileId=file_id,
-        addParents=folder_id,
-        removeParents=prev_parents if prev_parents else None,
-        fields="id, parents"
-    ).execute()
+    Reutiliza un Spreadsheet por ID si GOOGLE_SHEETS_SPREADSHEET_ID está definido.
+    Si no, busca por título en Drive; si no existe, crea uno y lo mueve a la carpeta 'Automatizaciones-no-tocar'.
+    """
+    # 1) Reusar por ID si está definido
+    ssid = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
+    if ssid:
+        return ssid
+
+    # 2) Intentar localizar por título (si tenemos Drive)
+    if drive is not None:
+        q = f"name = '{title}' and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false"
+        resp = drive.files().list(q=q, spaces="drive", fields="files(id,name)", pageSize=5).execute()
+        items = resp.get("files", [])
+        if items:
+            return items[0]["id"]
+
+    # 3) Crear si no se encuentra
+    body = {"properties": {"title": title}}
+    created = svc.spreadsheets().create(body=body, fields="spreadsheetId").execute()
+    ssid = created["spreadsheetId"]
+
+    # mover a carpeta
+    if drive is not None:
+        folder_id = get_or_create_folder_id(drive, "Automatizaciones-no-tocar")
+        move_file_to_folder(drive, ssid, folder_id)
+
+    return ssid
+
+def sheet_exists(svc, spreadsheet_id: str, title: str) -> bool:
+    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    for s in meta.get("sheets", []):
+        if s.get("properties", {}).get("title") == title:
+            return True
+    return False
 
 def get_sheet_id_by_title(svc, spreadsheet_id: str, title: str) -> Optional[int]:
-    """Return the numeric sheet ID for a given sheet title within a spreadsheet."""
     meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    for sh in meta.get("sheets", []):
-        if sh["properties"]["title"] == title:
-            return sh["properties"]["sheetId"]
+    for s in meta.get("sheets", []):
+        props = s.get("properties", {})
+        if props.get("title") == title:
+            return props.get("sheetId")
     return None
 
-def sort_data_sheet_by_name(svc, spreadsheet_id: str, sheet_title: str):
-    """
-    Sort the rows of a sheet by the first column (Nombre) in ascending order.
-
-    Keeps the header row fixed and sorts only the data rows.
-    """
-    sheet_id = get_sheet_id_by_title(svc, spreadsheet_id, sheet_title)
-    if sheet_id is None:
-        return
-    requests = [{
-        "sortRange": {
-            "range": {
-                "sheetId": sheet_id,
-                "startRowIndex": 1
-            },
-            "sortSpecs": [{
-                "dimensionIndex": 0,
-                "sortOrder": "ASCENDING"
-            }]
-        }
-    }]
-    svc.spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body={"requests": requests}
-    ).execute()
-
-
-def export_patients_to_csv(svc, spreadsheet_id: str, filename: str = "pacientes.csv") -> None:
-    """Export the patients sheet into a CSV file in the working directory.
-
-    The resulting file can be committed to the repository so that other
-    scripts (e.g. WhatsApp integration) can read patient information
-    without querying Google Sheets directly. This operation reads all
-    rows from the ``DATA_SHEET`` tab excluding the header. If no data
-    exists, the file will be created with only the header row.
-
-    :param svc: An authorised Sheets API service.
-    :param spreadsheet_id: The ID of the spreadsheet to read.
-    :param filename: The filename to write (relative to the current working directory).
-    """
-    # Fetch the entire data sheet including headers
-    rng = f"{DATA_SHEET}!A1:F"
-    resp = svc.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=rng,
-        valueRenderOption="UNFORMATTED_VALUE",
-        dateTimeRenderOption="FORMATTED_STRING"
-    ).execute()
-    values: List[List[str]] = resp.get("values", []) if resp else []
-    # Write to CSV; ensure always header row present
-    with open(filename, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        for row in values:
-            # Pad rows to expected length (6 columns) to avoid variable column counts
-            writer.writerow(row + [""] * (6 - len(row)))
-
-
 def ensure_sheets_and_headers(svc, spreadsheet_id: str):
-    """Ensure that the data and meta sheets exist with appropriate headers."""
-    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    titles = {sh["properties"]["title"] for sh in meta.get("sheets", [])}
-    requests: List[dict] = []
+    requests = []
 
-    def add_sheet(title: str):
-        requests.append({"addSheet": {"properties": {"title": title}}})
+    # crear pestaña DATA si falta
+    if not sheet_exists(svc, spreadsheet_id, DATA_SHEET):
+        requests.append({
+            "addSheet": {
+                "properties": {"title": DATA_SHEET}
+            }
+        })
+    # crear pestaña META si falta
+    if not sheet_exists(svc, spreadsheet_id, META_SHEET):
+        requests.append({
+            "addSheet": {
+                "properties": {"title": META_SHEET}
+            }
+        })
 
-    if DATA_SHEET not in titles:
-        add_sheet(DATA_SHEET)
-    if META_SHEET not in titles:
-        add_sheet(META_SHEET)
     if requests:
-        svc.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id, body={"requests": requests}
-        ).execute()
+        svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
 
-    def write_headers(sheet: str, headers: List[str]):
-        rng = f"{sheet}!A1:{chr(64 + len(headers))}1"
+    # encabezados
+    def set_headers(title: str, headers: List[str]):
+        rng = f"{title}!A1:{chr(64 + len(headers))}1"
         svc.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range=rng,
@@ -542,46 +187,35 @@ def ensure_sheets_and_headers(svc, spreadsheet_id: str):
             body={"values": [headers]},
         ).execute()
 
-    def is_empty(sheet: str) -> bool:
-        rng = f"{sheet}!A1:A1"
-        resp = svc.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=rng
-        ).execute()
-        return not resp.get("values")
-
-    if is_empty(DATA_SHEET):
-        write_headers(
-            DATA_SHEET,
-            [
-                "Nombre",
-                "Apellidos",
-                "Telefono",
-                "Email",
-                "Gmail_Message_ID",
-                "Gmail_Date",
-            ],
-        )
-    if is_empty(META_SHEET):
-        write_headers(META_SHEET, ["Gmail_Message_ID", "Processed_At"])
-
-
-def read_set_from_col(svc, spreadsheet_id: str, sheet: str, col_letter: str) -> set:
-    """Read unique values from a column as a set."""
-    rng = f"{sheet}!{col_letter}2:{col_letter}"
-    resp = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
-    vals = resp.get("values", [])
-    return {row[0].strip() for row in vals if row and row[0].strip()}
-
+    set_headers(DATA_SHEET, ["Nombre", "Apellidos", "Telefono", "Email", "Gmail_Message_ID", "Gmail_Date"])
+    set_headers(META_SHEET, ["Gmail_Message_ID"])
 
 def read_processed_ids(svc, spreadsheet_id: str) -> set:
-    return read_set_from_col(svc, spreadsheet_id, META_SHEET, "A")
+    rng = f"{META_SHEET}!A2:A"
+    resp = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
+    vals = resp.get("values", [])
+    return {row[0] for row in vals if row}
 
+def read_set_from_col(svc, spreadsheet_id: str, sheet_title: str, col_letter: str) -> set:
+    rng = f"{sheet_title}!{col_letter}2:{col_letter}"
+    resp = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
+    vals = resp.get("values", [])
+    out = set()
+    for row in vals:
+        if not row:
+            continue
+        value = str(row[0]).strip()
+        if not value:
+            continue
+        if col_letter.upper() == "C":  # Teléfono: normalizar quitando espacios
+            value = value.replace(" ", "")
+        out.add(value)
+    return out
 
-def append_rows(svc, spreadsheet_id: str, sheet: str, rows: List[List[str]]):
-    """Append rows to a Google sheet."""
+def append_rows(svc, spreadsheet_id: str, sheet_title: str, rows: List[List[str]]):
     if not rows:
         return
-    rng = f"{sheet}!A:A"
+    rng = f"{sheet_title}!A:A"
     svc.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=rng,
@@ -590,87 +224,309 @@ def append_rows(svc, spreadsheet_id: str, sheet: str, rows: List[List[str]]):
         body={"values": rows},
     ).execute()
 
+def sort_data_sheet_by_name(svc, spreadsheet_id: str, sheet_title: str):
+    sheet_id = get_sheet_id_by_title(svc, spreadsheet_id, sheet_title)
+    if sheet_id is None:
+        return
+    requests = [{
+        "sortRange": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": 1,  # no ordenar cabecera
+                "startColumnIndex": 0,
+            },
+            "sortSpecs": [{"dimensionIndex": 0, "sortOrder": "ASCENDING"}]
+        }
+    }]
+    svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
 
+def export_patients_to_repo(svc, spreadsheet_id: str,
+                            sheet_title: str = DATA_SHEET,
+                            out_dir: str = "outputs",
+                            csv_name: str = "pacs_contacts.csv",
+                            json_name: str = "pacs_contacts_index.json") -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    rng = f"{sheet_title}!A1:F"
+    resp = svc.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id, range=rng, valueRenderOption="UNFORMATTED_VALUE"
+    ).execute()
+    rows = resp.get("values", []) or []
+    if not rows:
+        return
+
+    # CSV completo
+    csv_path = os.path.join(out_dir, csv_name)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerows(rows)
+
+    # Índice JSON por teléfono normalizado
+    header = rows[0]
+    idx = {h.lower(): i for i, h in enumerate(header)}
+    def col(name): return idx.get(name, -1)
+
+    index = {}
+    for r in rows[1:]:
+        if not r:
+            continue
+        try:
+            tel = str(r[col("telefono")]).replace(" ", "")
+        except Exception:
+            continue
+        if not tel:
+            continue
+        entry = {
+            "nombre": r[col("nombre")] if 0 <= col("nombre") < len(r) else "",
+            "apellidos": r[col("apellidos")] if 0 <= col("apellidos") < len(r) else "",
+            "email": r[col("email")] if 0 <= col("email") < len(r) else "",
+            "gmail_id": r[col("gmail_message_id")] if 0 <= col("gmail_message_id") < len(r) else "",
+            "fecha": r[col("gmail_date")] if 0 <= col("gmail_date") < len(r) else "",
+        }
+        index[tel] = entry
+
+    json_path = os.path.join(out_dir, json_name)
+    with open(json_path, "w", encoding="utf-8") as jf:
+        json.dump(index, jf, ensure_ascii=False, indent=2)
+
+# === Parsing de mensajes ===
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}")
+PHONE_RE = re.compile(r"(?:\+?34[\s\-]?)?(?:\d[\s\-]?){9,13}")
+
+def normalize_phone(s: str) -> str:
+    # quita todo menos dígitos y '+', añade +34 si son 9 dígitos nacionales
+    s2 = re.sub(r"[^\d+]", "", s or "")
+    if s2.startswith("+"):
+        return s2
+    digits = re.sub(r"\D", "", s2)
+    return "+34" + digits if len(digits) == 9 else s2
+
+def normalize_case(text: str) -> str:
+    """
+    Title case conservador: 'mArIa eUgEnia MOReno' → 'Maria Eugenia Moreno'
+    Mantiene apóstrofes y guiones correctamente.
+    """
+    def _cap(tok: str) -> str:
+        if not tok:
+            return tok
+        return tok[0].upper() + tok[1:].lower()
+    parts = re.split(r"(\s|-|')", (text or "").strip())
+    return "".join(_cap(p) if i % 2 == 0 else p for i, p in enumerate(parts))
+
+def split_name(full_name: str) -> Tuple[str, str]:
+    full_name = re.sub(r"\s+", " ", full_name or "").strip()
+    if not full_name:
+        return "", ""
+    parts = full_name.split(" ")
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], " ".join(parts[1:])
+
+def guess_name_lines(text: str, email_found: Optional[str], phone_found: Optional[str]) -> str:
+    """
+    Heurísticas para nombres en correos Booksy:
+    - Patrones de "¡Nombre: nueva reserva"
+    - Patrones de cancelación "cita para <nombre> consulta/valoración"
+    - Candidatos cercanos a teléfono/email
+    - Descarta URLs, líneas con '@', palabras clave irrelevantes, branding
+    - Acepta líneas con viñeta '•' borrando la viñeta
+    """
+    # Cancelación / cita para
+    m_cancel = re.search(
+        r"cita\s+para\s+([^\n\d]+?)\s+(?:consulta|valoración|estética)", text, flags=re.I
+    )
+    if m_cancel:
+        return m_cancel.group(1).strip()
+
+    # "¡Nombre: nueva reserva"
+    m = re.search(r"¡\s*([^\n:]+?)\s*:\s*nueva\s+reserva", text, flags=re.I)
+    if m:
+        return m.group(1).strip()
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    cleaned = []
+    for ln in lines:
+        lnl = ln.lower()
+        # descartar URLs o líneas claramente no-nombre
+        if lnl.startswith("http") or "://" in lnl:
+            continue
+        if "reserva" in lnl or "cancelada" in lnl or "booksy" in lnl:
+            continue
+        if "consulta" in lnl or "valoración" in lnl or "tranquilidad" in lnl:
+            continue
+        if "ios" in lnl or "android" in lnl or "facebook" in lnl or "linkedin" in lnl or "youtube" in lnl:
+            continue
+        if "@" in ln:
+            continue  # evita confundir emails raros con nombres
+        # limpiar viñetas
+        ln = ln.lstrip("•").strip()
+        cleaned.append(ln)
+
+    # priorizar candidatos por capitalización y cercanía a teléfono/email
+    def _score(line: str) -> int:
+        toks = [t for t in line.split() if t]
+        score = 0
+        for t in toks:
+            if len(t) > 1 and t[0].isalpha():
+                score += 1
+        return score
+
+    candidates = sorted(cleaned[:30], key=_score, reverse=True)
+    if candidates:
+        return candidates[0]
+
+    return ""
+
+def parse_patient(text: str) -> Dict[str, str]:
+    # Email
+    email = None
+    m = EMAIL_RE.search(text or "")
+    if m:
+        email = m.group(0).strip().lower()
+
+    # Teléfono
+    phone = None
+    m2 = PHONE_RE.search(text or "")
+    if m2:
+        phone = normalize_phone(m2.group(0))
+
+    # Nombre (línea heurística)
+    name_line = guess_name_lines(text or "", email, phone)
+    nombre, apellidos = split_name(name_line)
+
+    # Normalización de nombres y apellidos (Title case conservador)
+    nombre = normalize_case(nombre)
+    apellidos = normalize_case(apellidos)
+
+    return {
+        "nombre": nombre,
+        "apellidos": apellidos,
+        "telefono": phone or "",
+        "email": email or "",
+    }
+
+# === Gmail fetch ===
+def list_booksy_messages(service, after: Optional[str] = None, max_pages: int = 50) -> List[Dict]:
+    """
+    Lista mensajes de Gmail desde BOOKSY. `after` en formato YYYY/MM/DD para histórico si se desea.
+    """
+    query = f"from:{BOOKSY_SENDER}"
+    if after:
+        query += f" after:{after}"
+    msgs = []
+    page_token = None
+    for _ in range(max_pages):
+        resp = service.users().messages().list(
+            userId="me", q=query, pageToken=page_token, maxResults=100
+        ).execute()
+        ids = resp.get("messages", []) or []
+        msgs.extend(ids)
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return msgs
+
+def get_message_payload(service, msg_id: str) -> Tuple[str, str]:
+    """
+    Devuelve (fecha_iso_utc, cuerpo_texto) para un mensaje dado.
+    """
+    msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+    # fecha
+    internal_date = msg.get("internalDate")
+    if internal_date:
+        dt = datetime.fromtimestamp(int(internal_date)/1000.0, tz=timezone.utc)
+        date_iso = dt.isoformat().replace("+00:00", "Z")
+    else:
+        date_iso = ""
+
+    # cuerpo
+    payload = msg.get("payload", {})
+    body_text = ""
+
+    def _decode(part_body):
+        data = part_body.get("data")
+        if not data:
+            return ""
+        return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+
+    if "parts" in payload:
+        for p in payload["parts"]:
+            mime = p.get("mimeType", "")
+            if mime == "text/plain":
+                body_text += _decode(p.get("body", {}))
+            elif mime == "text/html":
+                # como fallback, incluir texto llano de HTML también
+                body_text += re.sub("<[^>]+>", " ", _decode(p.get("body", {})))
+    else:
+        body_text += _decode(payload.get("body", {}))
+
+    return date_iso, body_text
+
+# === Proceso principal ===
 def process():
-    """Main processing function."""
     creds = get_creds()
     gmail = gmail_service(creds)
     sheets = sheets_service(creds)
-    # Initialize Drive service and create/get spreadsheet in target folder
     drive = drive_service(creds)
+
     ssid = get_or_create_spreadsheet_id(sheets, SHEET_TITLE, drive)
     ensure_sheets_and_headers(sheets, ssid)
+
     processed_ids = read_processed_ids(sheets, ssid)
     existing_emails = read_set_from_col(sheets, ssid, DATA_SHEET, "D")
     existing_phones = read_set_from_col(sheets, ssid, DATA_SHEET, "C")
-    msg_ids = list_message_ids(gmail, "me", GMAIL_QUERY)
+
+    # historial completo la primera vez; después, solo nuevos
+    after = None  # si quisieras acotar: after="2022/01/01"
+    ids = list_booksy_messages(gmail, after=after, max_pages=200)
+
     rows_data: List[List[str]] = []
     rows_meta: List[List[str]] = []
-    for mid in msg_ids:
-        if mid in processed_ids:
+
+    for item in ids:
+        mid = item.get("id")
+        if not mid or mid in processed_ids:
             continue
-        try:
-            msg = get_message_full(gmail, "me", mid)
-            payload = msg.get("payload", {})
-            text = decode_body(payload)
-            patient = parse_patient(text)
-            nombre = patient.get("nombre", "").strip()
-            apellidos = patient.get("apellidos", "").strip()
-            telefono = patient.get("telefono", "").strip()
-            email = patient.get("email", "").strip()
-            key_exists = False
-            if email and email in existing_emails:
-                key_exists = True
-            if telefono and telefono in existing_phones:
-                key_exists = True
-            internal_date = msg.get("internalDate")
-            gmail_date_iso = ""
-            if internal_date:
-                try:
-                    ts = int(internal_date) / 1000.0
-                    gmail_date_iso = dt.datetime.utcfromtimestamp(ts).isoformat() + "Z"
-                except Exception:
-                    gmail_date_iso = ""
-            if not key_exists and (email or telefono or nombre or apellidos):
-                rows_data.append(
-                    [
-                        nombre,
-                        apellidos,
-                        telefono,
-                        email,
-                        mid,
-                        gmail_date_iso,
-                    ]
-                )
-                if email:
-                    existing_emails.add(email)
-                if telefono:
-                    existing_phones.add(telefono)
-            now_iso = dt.datetime.utcnow().isoformat() + "Z"
-            rows_meta.append([mid, now_iso])
-            if len(rows_meta) >= 200:
-                append_rows(sheets, ssid, DATA_SHEET, rows_data)
-                append_rows(sheets, ssid, META_SHEET, rows_meta)
-                rows_data.clear()
-                rows_meta.clear()
-        except HttpError as e:
-            print(f"Gmail API error on {mid}: {e}", file=sys.stderr)
-            time.sleep(1)
+
+        date_iso, body = get_message_payload(gmail, mid)
+        parsed = parse_patient(body)
+        nombre = parsed["nombre"]
+        apellidos = parsed["apellidos"]
+        telefono = (parsed["telefono"] or "").replace(" ", "")
+        email = parsed["email"]
+
+        # validez mínima
+        if not (nombre or apellidos) or not (telefono or email):
+            # marcar como procesado para no reintentar eternamente
+            rows_meta.append([mid])
             continue
-        except Exception as ex:
-            print(f"Error processing {mid}: {ex}", file=sys.stderr)
+
+        # deduplicación por email/teléfono
+        if telefono and telefono in existing_phones:
+            rows_meta.append([mid])
             continue
+        if email and email in existing_emails:
+            rows_meta.append([mid])
+            continue
+
+        # almacenar nueva fila
+        rows_data.append([nombre, apellidos, telefono, email, mid, date_iso])
+        rows_meta.append([mid])
+
+        # actualizar sets en caliente para evitar duplicados en el mismo batch
+        if telefono:
+            existing_phones.add(telefono)
+        if email:
+            existing_emails.add(email)
+
+    # escribir en Sheets
     append_rows(sheets, ssid, DATA_SHEET, rows_data)
     append_rows(sheets, ssid, META_SHEET, rows_meta)
-    # After appending, sort the data sheet by the first column (Nombre)
+
+    # ordenar por Nombre (columna A)
     sort_data_sheet_by_name(sheets, ssid, DATA_SHEET)
 
-    # Export all patient data to a CSV file within the repository.  This CSV can
-    # be committed so that other scripts (e.g. WhatsApp integration) can
-    # access the patient list without querying Sheets. The file will
-    # include the header row followed by all rows in the sheet.
-    export_patients_to_csv(sheets, ssid, filename="pacientes.csv")
-
+    # exportar a repo
+    export_patients_to_repo(sheets, ssid, DATA_SHEET)
 
 if __name__ == "__main__":
     process()
