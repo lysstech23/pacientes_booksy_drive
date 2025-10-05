@@ -66,6 +66,7 @@ DATA_SHEET = "directorio_pacientes"
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file",
 ]
 
 
@@ -210,9 +211,14 @@ def normalize_phone(s: str) -> str:
 
 def guess_name_lines(text: str, email_found: Optional[str], phone_found: Optional[str]) -> str:
     """Heuristic to guess the patient's full name from the email body."""
+    # Look for pattern '¡Nombre Apellido: nueva reserva'
     m = re.search(r"¡\s*([^\n:]+?)\s*:\s*nueva\s+reserva", text, flags=re.I)
     if m:
         return m.group(1).strip()
+    # Also handle phrase 'cita para <nombre> Consulta' (e.g. cancellation emails)
+    m2 = re.search(r"cita\s+para\s+([^\n]+?)\s+Consulta", text, flags=re.I)
+    if m2:
+        return m2.group(1).strip()
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     indices = []
     if email_found:
@@ -227,30 +233,51 @@ def guess_name_lines(text: str, email_found: Optional[str], phone_found: Optiona
     for idx in indices or [0]:
         for j in range(max(0, idx - 3), min(len(lines), idx + 3)):
             ln = lines[j]
-            if EMAIL_RE.search(ln):
+            # Skip lines containing emails or phones
+            if EMAIL_RE.search(ln) or PHONE_RE.search(ln):
                 continue
-            if PHONE_RE.search(ln):
-                continue
+            # Skip lines that look like money, EUR or contain time (e.g. 16:30)
             if re.search(r"\b€|\bEUR|\d{1,2}:\d{2}", ln):
+                continue
+            # Skip URL-like lines
+            lnl = ln.lower()
+            if "http" in lnl or "https" in lnl:
+                continue
+            # Handle Booksy branding lines and bullet characters.
+            # Booksy sometimes prefixes names with a bullet (e.g. "• Maria Garcia").
+            # If a line starts with a bullet, strip it off before further checks instead of discarding it.
+            if ln.startswith("•"):
+                ln = ln.lstrip("•").strip()
+                lnl = ln.lower()
+            # Skip lines starting with Booksy (branding), which should not be used for names.
+            if lnl.startswith("booksy"):
                 continue
             tokens = ln.split()
             if 1 <= len(tokens) <= 5:
+                # Count how many tokens start with an uppercase letter (for languages using accents)
                 cap_score = sum(
                     1 for t in tokens if re.match(r"^[A-ZÁÉÍÓÚÑ][a-záéíóúñü]+$", t)
                 )
-                if cap_score >= max(1, len(tokens) // 2):
-                    candidates.append((j, ln))
+                # Store tuple of index, line and capitalization score
+                candidates.append((j, ln, cap_score))
     if candidates:
-        candidates.sort(key=lambda x: x[0])
+        # Prefer lines with more capitalized tokens; tie‑break by closeness to the email/phone line
+        candidates.sort(key=lambda x: (-x[2], x[0]))
         return candidates[0][1]
-    for ln in lines[:15]:
-        tokens = ln.split()
+    # Fallback: return the first plausible line among the first 20 lines.
+    # If a line begins with a bullet, strip the bullet before evaluating and returning.
+    for ln in lines[:20]:
+        # Remove a leading bullet character if present
+        ln_clean = ln.lstrip("•").strip() if ln.startswith("•") else ln
+        tokens = ln_clean.split()
         if (
             1 <= len(tokens) <= 5
             and not EMAIL_RE.search(ln)
             and not PHONE_RE.search(ln)
+            and "http" not in ln.lower()
+            and "https" not in ln.lower()
         ):
-            return ln
+            return ln_clean
     return ""
 
 
@@ -287,13 +314,96 @@ def sheets_service(creds: Credentials):
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
-def get_or_create_spreadsheet_id(svc, title: str) -> str:
+def get_or_create_spreadsheet_id(svc, title: str, drive=None) -> str:
+    """
+    Return the spreadsheet ID for a given title, creating it if necessary.
+
+    If GOOGLE_SHEETS_SPREADSHEET_ID is set in the environment, that ID is used and returned.
+    When creating a new spreadsheet and a Drive service is provided, the new file is moved
+    into the folder named 'Automatizaciones-no tocar' in the user's Google Drive.
+    """
     ssid = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
     if ssid:
         return ssid
     body = {"properties": {"title": title}}
     resp = svc.spreadsheets().create(body=body, fields="spreadsheetId").execute()
-    return resp["spreadsheetId"]
+    ssid = resp["spreadsheetId"]
+    if drive is not None:
+        folder_id = get_or_create_folder_id(drive, "Automatizaciones-no tocar")
+        move_file_to_folder(drive, ssid, folder_id)
+    return ssid
+
+def drive_service(creds: Credentials):
+    """Initialize Google Drive API service."""
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+def get_or_create_folder_id(drive, folder_name: str = "Automatizaciones-no tocar") -> str:
+    """
+    Find or create a folder in Google Drive.
+
+    If a folder with the given name exists (and is not trashed), return its ID.
+    Otherwise create the folder and return the new folder ID.
+    """
+    # Escape single quotes in the folder name for the query
+    name_q = folder_name.replace("'", "\\'")
+    query = f"name = '{name_q}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    resp = drive.files().list(q=query, spaces="drive", fields="files(id,name)", pageSize=1).execute()
+    files = resp.get("files", [])
+    if files:
+        return files[0]["id"]
+    body = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
+    folder = drive.files().create(body=body, fields="id").execute()
+    return folder["id"]
+
+def move_file_to_folder(drive, file_id: str, folder_id: str):
+    """
+    Move a file into a target folder in Google Drive.
+
+    Removes the file from its previous parent folders and adds the new folder as its parent.
+    """
+    # Get current parents
+    file = drive.files().get(fileId=file_id, fields="parents").execute()
+    prev_parents = ",".join(file.get("parents", []))
+    drive.files().update(
+        fileId=file_id,
+        addParents=folder_id,
+        removeParents=prev_parents if prev_parents else None,
+        fields="id, parents"
+    ).execute()
+
+def get_sheet_id_by_title(svc, spreadsheet_id: str, title: str) -> Optional[int]:
+    """Return the numeric sheet ID for a given sheet title within a spreadsheet."""
+    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    for sh in meta.get("sheets", []):
+        if sh["properties"]["title"] == title:
+            return sh["properties"]["sheetId"]
+    return None
+
+def sort_data_sheet_by_name(svc, spreadsheet_id: str, sheet_title: str):
+    """
+    Sort the rows of a sheet by the first column (Nombre) in ascending order.
+
+    Keeps the header row fixed and sorts only the data rows.
+    """
+    sheet_id = get_sheet_id_by_title(svc, spreadsheet_id, sheet_title)
+    if sheet_id is None:
+        return
+    requests = [{
+        "sortRange": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": 1
+            },
+            "sortSpecs": [{
+                "dimensionIndex": 0,
+                "sortOrder": "ASCENDING"
+            }]
+        }
+    }]
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": requests}
+    ).execute()
 
 
 def ensure_sheets_and_headers(svc, spreadsheet_id: str):
@@ -377,7 +487,9 @@ def process():
     creds = get_creds()
     gmail = gmail_service(creds)
     sheets = sheets_service(creds)
-    ssid = get_or_create_spreadsheet_id(sheets, SHEET_TITLE)
+    # Initialize Drive service and create/get spreadsheet in target folder
+    drive = drive_service(creds)
+    ssid = get_or_create_spreadsheet_id(sheets, SHEET_TITLE, drive)
     ensure_sheets_and_headers(sheets, ssid)
     processed_ids = read_processed_ids(sheets, ssid)
     existing_emails = read_set_from_col(sheets, ssid, DATA_SHEET, "D")
@@ -441,6 +553,8 @@ def process():
             continue
     append_rows(sheets, ssid, DATA_SHEET, rows_data)
     append_rows(sheets, ssid, META_SHEET, rows_meta)
+    # After appending, sort the data sheet by the first column (Nombre)
+    sort_data_sheet_by_name(sheets, ssid, DATA_SHEET)
 
 
 if __name__ == "__main__":
