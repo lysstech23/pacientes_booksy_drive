@@ -49,6 +49,7 @@ import time
 import json
 import datetime as dt
 from typing import Dict, List, Optional, Tuple
+import csv
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -292,6 +293,29 @@ def split_name(full_name: str) -> Tuple[str, str]:
     return parts[0], " ".join(parts[1:])
 
 
+def normalize_case(name: str) -> str:
+    """Return a name string with each word capitalised and the rest in lowercase.
+
+    Examples:
+        >>> normalize_case("maria eugenia moreno")
+        'Maria Eugenia Moreno'
+
+    This helper ensures consistency when storing names in the sheet and
+    generating patient lists for other scripts. It does not alter
+    embedded punctuation beyond standardising whitespace.
+    """
+    if not name:
+        return ""
+    words: List[str] = []
+    for w in name.strip().split():
+        if not w:
+            continue
+        # Capitalise first character and lowercase the rest. This works
+        # for accented letters in most cases.
+        words.append(w[0].upper() + w[1:].lower() if len(w) > 1 else w.upper())
+    return " ".join(words)
+
+
 def parse_patient(text: str) -> Dict[str, str]:
     """Extract patient data from the body text."""
     email_match = EMAIL_RE.search(text)
@@ -301,6 +325,9 @@ def parse_patient(text: str) -> Dict[str, str]:
     phone = normalize_phone(phone_raw) if phone_raw else ""
     name_line = guess_name_lines(text, email, phone)
     nombre, apellidos = split_name(name_line)
+    # Normalise the capitalisation of names: first letter uppercase, rest lowercase
+    nombre = normalize_case(nombre)
+    apellidos = normalize_case(apellidos)
     return {
         "nombre": nombre,
         "apellidos": apellidos,
@@ -318,19 +345,71 @@ def get_or_create_spreadsheet_id(svc, title: str, drive=None) -> str:
     """
     Return the spreadsheet ID for a given title, creating it if necessary.
 
-    If GOOGLE_SHEETS_SPREADSHEET_ID is set in the environment, that ID is used and returned.
-    When creating a new spreadsheet and a Drive service is provided, the new file is moved
-    into the folder named 'Automatizaciones-no tocar' in the user's Google Drive.
+    This helper first checks if a specific spreadsheet ID has been provided via the
+    ``GOOGLE_SHEETS_SPREADSHEET_ID`` environment variable. If so, it is returned
+    immediately. Otherwise, when a Drive service is available, the function
+    attempts to locate an existing Google Sheets file with the requested title
+    inside the ``Automatizaciones-no tocar`` folder. If found, its ID is returned.
+    Only when no such file exists is a new spreadsheet created. Newly created
+    spreadsheets are moved into the designated folder to keep files organised.
+
+    :param svc: An authorized Sheets API service instance.
+    :param title: The title of the spreadsheet to locate or create.
+    :param drive: Optional Drive API service used for searching and moving files.
+    :return: The spreadsheet ID as a string.
     """
-    ssid = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
-    if ssid:
-        return ssid
+    # Respect explicit spreadsheet ID if provided via environment variables.
+    ssid_env = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
+    if ssid_env:
+        return ssid_env
+
+    # When Drive service is available, look for an existing spreadsheet with the same title
+    # inside the target folder. If found, reuse its ID instead of creating a new file.
+    folder_id: Optional[str] = None
+    if drive is not None:
+        # Ensure the target folder exists (creating it if necessary)
+        folder_id = get_or_create_folder_id(drive, "Automatizaciones-no tocar")
+        # Escape single quotes in the title for the Drive query.
+        name_q = title.replace("'", "\\'")
+        query = (
+            f"name = '{name_q}' and "
+            "mimeType = 'application/vnd.google-apps.spreadsheet' and "
+            f"'{folder_id}' in parents and trashed = false"
+        )
+        try:
+            resp = (
+                drive.files()
+                .list(
+                    q=query,
+                    spaces="drive",
+                    fields="files(id,name)",
+                    pageSize=1,
+                )
+                .execute()
+            )
+            files = resp.get("files", []) if resp else []
+            if files:
+                return files[0]["id"]
+        except Exception:
+            # If the search fails for any reason, continue to creation fallback.
+            pass
+
+    # If not found or Drive is unavailable, create a new spreadsheet
     body = {"properties": {"title": title}}
     resp = svc.spreadsheets().create(body=body, fields="spreadsheetId").execute()
     ssid = resp["spreadsheetId"]
+
+    # When a Drive service exists, move the new spreadsheet into the target folder
     if drive is not None:
-        folder_id = get_or_create_folder_id(drive, "Automatizaciones-no tocar")
-        move_file_to_folder(drive, ssid, folder_id)
+        try:
+            # Use previously resolved folder_id if available, otherwise create/find it now
+            if folder_id is None:
+                folder_id = get_or_create_folder_id(drive, "Automatizaciones-no tocar")
+            move_file_to_folder(drive, ssid, folder_id)
+        except Exception:
+            # Ignore any errors moving the file; the sheet will remain in root
+            pass
+
     return ssid
 
 def drive_service(creds: Credentials):
@@ -404,6 +483,36 @@ def sort_data_sheet_by_name(svc, spreadsheet_id: str, sheet_title: str):
         spreadsheetId=spreadsheet_id,
         body={"requests": requests}
     ).execute()
+
+
+def export_patients_to_csv(svc, spreadsheet_id: str, filename: str = "pacientes.csv") -> None:
+    """Export the patients sheet into a CSV file in the working directory.
+
+    The resulting file can be committed to the repository so that other
+    scripts (e.g. WhatsApp integration) can read patient information
+    without querying Google Sheets directly. This operation reads all
+    rows from the ``DATA_SHEET`` tab excluding the header. If no data
+    exists, the file will be created with only the header row.
+
+    :param svc: An authorised Sheets API service.
+    :param spreadsheet_id: The ID of the spreadsheet to read.
+    :param filename: The filename to write (relative to the current working directory).
+    """
+    # Fetch the entire data sheet including headers
+    rng = f"{DATA_SHEET}!A1:F"
+    resp = svc.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=rng,
+        valueRenderOption="UNFORMATTED_VALUE",
+        dateTimeRenderOption="FORMATTED_STRING"
+    ).execute()
+    values: List[List[str]] = resp.get("values", []) if resp else []
+    # Write to CSV; ensure always header row present
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        for row in values:
+            # Pad rows to expected length (6 columns) to avoid variable column counts
+            writer.writerow(row + [""] * (6 - len(row)))
 
 
 def ensure_sheets_and_headers(svc, spreadsheet_id: str):
@@ -555,6 +664,12 @@ def process():
     append_rows(sheets, ssid, META_SHEET, rows_meta)
     # After appending, sort the data sheet by the first column (Nombre)
     sort_data_sheet_by_name(sheets, ssid, DATA_SHEET)
+
+    # Export all patient data to a CSV file within the repository.  This CSV can
+    # be committed so that other scripts (e.g. WhatsApp integration) can
+    # access the patient list without querying Sheets. The file will
+    # include the header row followed by all rows in the sheet.
+    export_patients_to_csv(sheets, ssid, filename="pacientes.csv")
 
 
 if __name__ == "__main__":
