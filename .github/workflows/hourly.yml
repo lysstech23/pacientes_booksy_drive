@@ -27,3 +27,9 @@ jobs:
           GOOGLE_SHEETS_SPREADSHEET_ID: ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }}
           GOOGLE_SHEETS_TITLE: directorio_pacientes
         run: python src/booksy_gmail_to_sheets.py
+      - name: Publicar artefacto con contactos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pacientes_booksy_drive
+          path: outputs/
+          if-no-files-found: warn
