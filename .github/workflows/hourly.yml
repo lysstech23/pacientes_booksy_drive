@@ -2,33 +2,56 @@ name: Booksy to Google Sheet (hourly)
 
 on:
   schedule:
-    - cron: "0 * * * *"  # runs every hour
+    - cron: "0 * * * *"  # hourly, UTC
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hourly-booksy
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    env:
+      TZ: Europe/Madrid
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+      # Opcional: fija la hoja existente para no crear nuevas
+      GOOGLE_SHEETS_SPREADSHEET_ID: ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install dependencies
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      - name: Execute script
-        env:
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          GOOGLE_SHEETS_SPREADSHEET_ID: ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }}
-          GOOGLE_SHEETS_TITLE: directorio_pacientes
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install google-api-python-client google-auth google-auth-oauthlib
+          fi
+
+      - name: Ensure outputs dir
+        run: mkdir -p outputs
+
+      - name: Run script
         run: python src/booksy_gmail_to_sheets.py
-      - name: Publicar artefacto con contactos
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload contacts artifact
+        uses: actions/upload-artifact@v4
         with:
           name: pacientes_booksy_drive
           path: outputs/
